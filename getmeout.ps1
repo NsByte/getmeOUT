@@ -223,6 +223,24 @@ public class WfpApi {
 
     [DllImport("fwpuclnt.dll")]
     public static extern uint FwpmEngineClose0(IntPtr engineHandle);
+
+    public static uint LastOpenError;
+
+    // One-shot native purge: open (DEFAULT auth - what netsh uses), delete,
+    // close. Zero PS marshaling in the loop. Returns deleted count, or -1
+    // if the engine could not be opened (see LastOpenError).
+    public static int PurgeFilters(long[] ids) {
+        IntPtr handle;
+        uint rc = FwpmEngineOpen0(null, 0xFFFFFFFF, IntPtr.Zero, IntPtr.Zero, out handle);
+        if (rc != 0) { LastOpenError = rc; return -1; }
+        int ok = 0;
+        foreach (long id in ids) {
+            uint r = FwpmFilterDeleteById0(handle, (ulong)id);
+            if (r == 0 || r == 0x80320003) { ok++; }   // 0x..3 = already gone
+        }
+        FwpmEngineClose0(handle);
+        return ok;
+    }
 }
 "@
 
@@ -434,61 +452,6 @@ function Save-Backup {
     Write-Ok "Backup saved to: $Path"
 }
 
-function Open-WfpEngine {
-    # 0x32 (ERROR_NOT_SUPPORTED) has been observed for RPC_C_AUTHN_WINNT on
-    # some builds - fall through the authentication methods until one opens.
-    # No hex literals: some builds fail converting them to UInt32.
-    $authNone    = [uint32]0
-    $authWinnt   = [uint32]10
-    $authDefault = [uint32]::MaxValue   # RPC_C_AUTHN_DEFAULT - what netsh itself uses
-    $attempts = @(
-        @{ Name = 'RPC_C_AUTHN_WINNT';   Id = $authWinnt },
-        @{ Name = 'RPC_C_AUTHN_NONE';    Id = $authNone },
-        @{ Name = 'RPC_C_AUTHN_DEFAULT'; Id = $authDefault }
-    )
-
-    $tryAllAuths = {
-        foreach ($a in $attempts) {
-            $engine = [System.IntPtr]::Zero
-            $result = [WfpApi]::FwpmEngineOpen0($null, $a.Id, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [ref]$engine)
-            if ($result -eq [uint32]0) {
-                Write-Ok "WFP engine opened ($($a.Name))"
-                return $engine
-            }
-            $hex = $result.ToString('X8')
-            Write-Warn "FwpmEngineOpen0 $($a.Name) failed: 0x$hex"
-        }
-        $null
-    }
-
-    $engine = & $tryAllAuths
-    if ($null -ne $engine -and $engine -ne [System.IntPtr]::Zero) { return $engine }
-
-    # Every auth mode refused: BFE's RPC state is wedged. A restart rebuilds
-    # the runtime filter set from the persistent store - which also clears
-    # the stale isolation filters. Then ask again.
-    Write-Warn 'All auth modes refused - restarting BFE once and retrying'
-    Invoke-Resilient 'Restart BFE' {
-        Restart-Service -Name BFE -Force -ErrorAction Stop
-        Start-Sleep -Seconds 3
-        foreach ($svc in 'mpssvc','iphlpsvc','SharedAccess') {
-            Start-Service -Name $svc -ErrorAction SilentlyContinue
-        }
-    }
-    $engine = & $tryAllAuths
-    if ($null -ne $engine -and $engine -ne [System.IntPtr]::Zero) { return $engine }
-
-    # Still refusing: classify WHERE the failure is, in one photo-able block.
-    $bits = if ([Environment]::Is64BitProcess) { 'x64' } else { 'x86' }
-    Write-Fail "Engine open refused in PowerShell $($PSVersionTable.PSVersion) ($bits)."
-    Invoke-Resilient 'Firewall API probe (same BFE, supported surface)' {
-        New-NetFirewallRule -DisplayName 'getmeout-probe' -Direction Outbound -Action Allow -ErrorAction Stop | Out-Null
-        Remove-NetFirewallRule  -DisplayName 'getmeout-probe' -ErrorAction SilentlyContinue
-        Write-Ok 'Firewall API accepts writes: BFE healthy - failure is in the raw P/Invoke path.'
-    }
-    throw "Could not open the WFP engine. Send the hex codes + probe result above."
-}
-
 function Remove-WfpFilterById {
     param([IntPtr]$Engine, [System.UInt64]$FilterId, [string]$Name, [switch]$WhatIf)
 
@@ -562,25 +525,45 @@ function Invoke-WfpEscape {
         return $true
     }
 
-    Write-Step "Opening WFP engine"
-    $engine = Open-WfpEngine
-    Write-Ok "WFP engine opened"
+    # 5. Purge via native helper - zero PS marshaling in the entire path
+    Write-Step 'Purging BLOCK filters (native one-shot)'
+    $ids    = [long[]]@($blockFilters | ForEach-Object { [long]$_.FilterId })
+    $purged = [WfpApi]::PurgeFilters($ids)
+    if ($purged -ge 0) {
+        Write-Ok "Deleted : $purged filter(s)"
+        return $true
+    }
+    Write-Fail ("Engine open refused natively: 0x{0}" -f ([WfpApi]::LastOpenError).ToString('X8'))
 
-    Write-Step "Deleting $($blockFilters.Count) BLOCK filter(s)"
-    $ok   = 0
-    $fail = 0
+    # Bounce BFE via sc.exe - a child process, like netsh (the PS service
+    # cmdlets failed on SCM access on this box).
+    Write-Warn 'Bouncing BFE via sc.exe, then retrying'
+    Invoke-Resilient 'sc.exe BFE bounce' {
+        $null = sc.exe stop BFE
+        Start-Sleep -Seconds 3
+        $null = sc.exe start BFE
+        Start-Sleep -Seconds 3
+        $null = sc.exe start mpssvc
+        $null = sc.exe start iphlpsvc
+    }
+    $purged = [WfpApi]::PurgeFilters($ids)
+    if ($purged -ge 0) {
+        Write-Ok "Deleted after BFE bounce : $purged filter(s)"
+        return $true
+    }
+    Write-Fail ("Engine open refused after bounce: 0x{0}" -f ([WfpApi]::LastOpenError).ToString('X8'))
 
-    foreach ($f in $blockFilters) {
-        if (Remove-WfpFilterById -Engine $engine -FilterId $f.FilterId -Name $f.Name) {
-            $ok++
+    # Final classification: can the firewall API write at all (netsh child)?
+    Invoke-Resilient 'netsh firewall probe' {
+        $null = netsh advfirewall firewall add rule name="getmeout-probe" dir=out action=allow
+        $rc = $LASTEXITCODE
+        $null = netsh advfirewall firewall delete rule name="getmeout-probe"
+        if ($rc -eq 0) {
+            Write-Ok 'netsh firewall writes OK - BFE alive; the PS layer was the problem.'
         } else {
-            $fail++
+            Write-Warn "netsh firewall write failed ($rc) - BFE/WFP sick: sfc /scannow + reboot."
         }
     }
-
-    [WfpApi]::FwpmEngineClose0($engine) | Out-Null
-
-    Write-Ok "Removed : $ok filter(s)   Failed : $fail"
     return $true
 }
 
