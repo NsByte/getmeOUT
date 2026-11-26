@@ -94,6 +94,12 @@
     the SYSTEM run's transcript tail. Combine with any other switches; the
     SYSTEM run inherits them (minus -AsSystem itself).
 
+.PARAMETER SystemShell
+    Switch. Spawns an interactive LOCAL SYSTEM terminal on your desktop
+    (Windows Terminal if available, classic console otherwise) via a
+    scheduled task with InteractiveToken - the builtin psexec -s -i. Run
+    this script yourself in that window; whoami confirms the context.
+
 .PARAMETER Loop
     Switch. Re-run the escape every -LoopMinutes for -LoopHours.
 
@@ -151,7 +157,8 @@ param(
     [int]$LoopHours   = 12,
     [switch]$FullReset,
     [switch]$Repair,
-    [switch]$AsSystem
+    [switch]$AsSystem,
+    [switch]$SystemShell
 )
 
 Set-StrictMode -Version Latest
@@ -1035,6 +1042,78 @@ function Invoke-Repair {
 }
 
 # ---------------------------------------------
+#  Interactive SYSTEM shell (Windows Terminal when possible)
+# ---------------------------------------------
+function Invoke-SystemShell {
+    Write-Step 'Spawning interactive LOCAL SYSTEM shell'
+    $scriptDir = Split-Path -Parent $PSCommandPath
+
+    $wt = $null
+    try { $wt = (Get-Command wt.exe -ErrorAction Stop).Source } catch { }
+
+    $psArgs = '-NoExit -NoProfile -ExecutionPolicy Bypass'
+    $execCmd   = 'powershell.exe'
+    $execArgs  = $psArgs
+    if ($wt) {
+        $execCmd  = $wt
+        $execArgs = "-d `"$scriptDir`" powershell $psArgs"
+        Write-Ok "Windows Terminal found: $wt"
+    }
+    else {
+        Write-Warn 'wt.exe not resolvable - falling back to a classic console window.'
+    }
+
+    $xml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>getmeout interactive SYSTEM shell</Description>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <ExecutionTimeLimit>PT24H</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>$execCmd</Command>
+      <Arguments>$execArgs</Arguments>
+      <WorkingDirectory>$scriptDir</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"@
+
+    $xmlPath = Join-Path $env:TEMP 'gm_shell.xml'
+    $xml | Out-File $xmlPath -Encoding Unicode -Force
+
+    $null = schtasks /create /f /tn gmShell /xml $xmlPath
+    if ($LASTEXITCODE -ne 0) { throw "schtasks import failed (exit $LASTEXITCODE) - are you elevated?" }
+    $null = schtasks /run /tn gmShell
+    if ($LASTEXITCODE -ne 0) { throw "schtasks run failed (exit $LASTEXITCODE)" }
+
+    Write-Ok 'SYSTEM shell launched - a terminal window appears on your desktop in a few seconds.'
+    Write-Info 'Confirm with: whoami   (expect nt authority\system)'
+    Write-Info 'Then run:     .\getmeout.ps1'
+    Write-Info 'If NO window appears, Windows Terminal refused the SYSTEM context -'
+    Write-Info 'rerun the task with the classic console: schtasks /delete /f /tn gmShell, then'
+    Write-Info 'swap <Command> to powershell.exe with empty <Arguments> in the XML and re-import.'
+    Write-Info 'Remove the task later: schtasks /delete /f /tn gmShell'
+}
+
+# ---------------------------------------------
 #  SYSTEM relay - run self as LOCAL SYSTEM via schtasks, then tail the log
 # ---------------------------------------------
 function Invoke-AsSystemRelay {
@@ -1094,6 +1173,9 @@ try {
 
 if ($AsSystem) {
     Invoke-AsSystemRelay
+}
+elseif ($SystemShell) {
+    Invoke-SystemShell
 }
 elseif ($Status) {
     Invoke-Status
