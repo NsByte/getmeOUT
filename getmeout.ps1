@@ -562,13 +562,15 @@ function Invoke-WfpEscape {
     Write-Step 'Purging BLOCK filters (native one-shot)'
     $idList = New-Object System.Collections.Generic.List[long]
     foreach ($f in $blockFilters) {
-        # Ids may arrive as scalars or as a whitespace-joined blob depending
-        # on how the upstream collection nested - split and take every token.
-        $idText = "$($f.FilterId)".Trim()
-        foreach ($tok in ($idText -split '[\s,;]+' | Where-Object { $_ })) {
-            if ($tok -match '^\d+$') { $idList.Add([long]$tok) }
-            else { Write-Warn "Skipping unusable id token '$tok'" }
+        # Format-agnostic: harvest every digit-run, whatever wraps it.
+        $idText = "$($f.FilterId)"
+        $ms = [regex]::Matches($idText, '\d{1,15}')
+        if ($ms.Count -eq 0) {
+            $prev = $idText.Substring(0, [Math]::Min(60, $idText.Length))
+            Write-Warn "Skipping filter with no numeric id: '$prev'"
+            continue
         }
+        foreach ($m in $ms) { $idList.Add([long]$m.Value) }
     }
     if ($idList.Count -eq 0) {
         Write-Warn 'No usable filter ids - nothing to purge.'
