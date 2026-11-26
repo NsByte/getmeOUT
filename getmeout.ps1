@@ -1,4 +1,4 @@
-﻿#Requires -RunAsAdministrator
+﻿# Self-elevates when needed; -AsSystem runs the escape as LOCAL SYSTEM.
 <#
 .SYNOPSIS
     getmeout - escape toolkit for a Windows 11 box locked down by MDE
@@ -88,6 +88,12 @@
     WFP sanity check, factory firewall reset, permissive policy, Winsock/TCP
     reset. Reboot after.
 
+.PARAMETER AsSystem
+    Switch. Relays this invocation to a one-shot scheduled task running as
+    LOCAL SYSTEM (the context MDE defenses are tuned for), waits, then prints
+    the SYSTEM run's transcript tail. Combine with any other switches; the
+    SYSTEM run inherits them (minus -AsSystem itself).
+
 .PARAMETER Loop
     Switch. Re-run the escape every -LoopMinutes for -LoopHours.
 
@@ -144,7 +150,8 @@ param(
     [int]$LoopMinutes = 5,
     [int]$LoopHours   = 12,
     [switch]$FullReset,
-    [switch]$Repair
+    [switch]$Repair,
+    [switch]$AsSystem
 )
 
 Set-StrictMode -Version Latest
@@ -172,6 +179,25 @@ function Invoke-Resilient {
         Write-Fail "$Label failed: $($_.Exception.Message)"
         return $false
     }
+}
+
+# Rebuild $PSBoundParameters as a command line - used for self-elevation and
+# the SYSTEM relay, so every switch survives the hop.
+function Convert-PSBoundToArgs {
+    param($Bound, [string[]]$Exclude = @())
+    $line = ''
+    foreach ($k in @($Bound.Keys)) {
+        if ($Exclude -contains $k) { continue }
+        $v = $Bound.$k
+        if ($v -is [System.Management.Automation.SwitchParameter]) {
+            if ($v) { $line += " -$k" }
+        }
+        elseif ($v -is [string]) {
+            if ($v) { $line += " -$k `"$v`"" }
+        }
+        else { $line += " -$k $v" }
+    }
+    return $line
 }
 
 # ---------------------------------------------
@@ -1009,13 +1035,59 @@ function Invoke-Repair {
 }
 
 # ---------------------------------------------
+#  SYSTEM relay - run self as LOCAL SYSTEM via schtasks, then tail the log
+# ---------------------------------------------
+function Invoke-AsSystemRelay {
+    Write-Step 'Relaying execution to LOCAL SYSTEM via scheduled task'
+    $argLine = Convert-PSBoundToArgs $script:PSBoundParameters @('AsSystem')
+    $taskCmd = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"$argLine"
+    Write-Info "Task command: $taskCmd"
+
+    $null = schtasks /create /f /tn getmeoutRun /ru SYSTEM /rl HIGHEST /tr $taskCmd
+    if ($LASTEXITCODE -ne 0) { throw "schtasks create failed (exit $LASTEXITCODE) - are you elevated?" }
+    $null = schtasks /run /tn getmeoutRun
+    if ($LASTEXITCODE -ne 0) { throw "schtasks run failed (exit $LASTEXITCODE)" }
+    Write-Ok 'SYSTEM task launched - waiting (the log keeps writing even if you Ctrl+C)'
+
+    $deadline = (Get-Date).AddMinutes(20)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 10
+        $q = (schtasks /query /tn getmeoutRun /fo csv /nh 2>$null | Out-String)
+        if ($q -notmatch 'Running') { break }
+    }
+
+    $logs = @(Get-ChildItem -Path 'C:\Windows\System32\config\systemprofile\AppData\Local\Temp\getmeout_*.log',
+                              'C:\Windows\Temp\getmeout_*.log' -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime | Select-Object -Last 1)
+    if ($logs.Count -gt 0) {
+        Write-Step "SYSTEM run transcript: $($logs[0].FullName)"
+        Get-Content $logs[0].FullName -Tail 80
+    }
+    else {
+        Write-Warn 'No SYSTEM transcript found - the task may still be starting; check again in a minute.'
+    }
+    Write-Info 'Remove the task later with: schtasks /delete /f /tn getmeoutRun'
+}
+
+# ---------------------------------------------
 #  Entry point
 # ---------------------------------------------
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Step 'Not elevated - relaunching elevated (accept the UAC prompt)'
+    $relaunch = "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"$(Convert-PSBoundToArgs $PSBoundParameters @())"
+    Start-Process powers.exe -Verb RunAs -ArgumentList $relaunch
+    exit
+}
+
 try {
     Start-Transcript -Path (Join-Path $env:TEMP "getmeout_$(Get-Date -Format 'yyyyMMdd_HHmmss').log") -ErrorAction SilentlyContinue | Out-Null
 } catch { }
 
-if ($Status) {
+if ($AsSystem) {
+    Invoke-AsSystemRelay
+}
+elseif ($Status) {
     Invoke-Status
 }
 elseif ($Repair) {
