@@ -549,9 +549,14 @@ function Invoke-NetworkRescue {
     Write-Step 'Network stack rescue'
 
     Invoke-Resilient 'Enable network adapters' {
-        Get-NetAdapter | Where-Object { $_.Status -ne 'Up' } | ForEach-Object {
-            Enable-NetAdapter -Name $_.Name -Confirm:$false
-            Write-Ok "Enabled adapter '$($_.Name)'"
+        foreach ($a in (Get-NetAdapter)) {
+            if ($a.Status -eq 'Up') { continue }
+            # Error 87 ("not supported") is normal for BT/virtual/disconnected
+            # adapters - attempt quietly and verify instead of trusting it.
+            $null = Enable-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction SilentlyContinue
+            $now = (Get-NetAdapter -Name $a.Name -ErrorAction SilentlyContinue).Status
+            if ($now -eq 'Up') { Write-Ok "Enabled adapter '$($a.Name)'" }
+            else { Write-Info "Skipped '$($a.Name)' (status: $now; not enableable)" }
         }
     }
 
@@ -625,8 +630,10 @@ function Invoke-VpnRescue {
         }
         foreach ($a in $virtual) {
             if ($a.Status -ne 'Up') {
-                Enable-NetAdapter -Name $a.Name -Confirm:$false
-                Write-Ok "Enabled virtual adapter '$($a.Name)'"
+                $null = Enable-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction SilentlyContinue
+                $now = (Get-NetAdapter -Name $a.Name -ErrorAction SilentlyContinue).Status
+                if ($now -eq 'Up') { Write-Ok "Enabled virtual adapter '$($a.Name)'" }
+                else { Write-Info "Skipped virtual '$($a.Name)' (status: $now)" }
             }
         }
     }
@@ -899,6 +906,23 @@ else {
     Invoke-PortalRelease       # vendor-supported release, if script provided
     Invoke-ApiRelease          # official release, if credentials were given
     $null = Invoke-EscapeOnce  # local escape: WFP + firewall + network + VPN
+
+    Write-Step 'Verification'
+    if (Test-Escape) {
+        Write-Ok 'Connectivity restored.'
+    }
+    else {
+        Write-Warn 'Still no connectivity - a block layer survived. Diagnosing:'
+        Invoke-Resilient 'WFP diagnostics' {
+            Invoke-DumpWfpDiagnostics -WfpXml (Get-WfpStateXml)
+        }
+        Write-Host ''
+        Write-Info 'Fixes to try, in order:'
+        Write-Info ' 1. Reboot - clears half-applied adapter/service state, then rerun.'
+        Write-Info ' 2. .\getmeout.ps1 -Status  and check the BLOCK filter names / SENSE events.'
+        Write-Info ' 3. Portal "force release" script via -ForceReleaseScript <path>, or -Api* release.'
+        Write-Info ' 4. .\getmeout.ps1 -FullReset, then reboot (Winsock/TCP stack reset).'
+    }
 
     Write-Host ''
     Write-Host '------------------------------------------' -ForegroundColor DarkGray
