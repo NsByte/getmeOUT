@@ -83,6 +83,11 @@
 .PARAMETER FullReset
     Switch. Additionally reset Winsock and TCP/IP (a reboot completes it).
 
+.PARAMETER Repair
+    Switch. Staged repair for a broken network stack: BFE/firewall services,
+    WFP sanity check, factory firewall reset, permissive policy, Winsock/TCP
+    reset. Reboot after.
+
 .PARAMETER Loop
     Switch. Re-run the escape every -LoopMinutes for -LoopHours.
 
@@ -138,7 +143,8 @@ param(
     [switch]$Loop,
     [int]$LoopMinutes = 5,
     [int]$LoopHours   = 12,
-    [switch]$FullReset
+    [switch]$FullReset,
+    [switch]$Repair
 )
 
 Set-StrictMode -Version Latest
@@ -391,13 +397,23 @@ function Save-Backup {
 }
 
 function Open-WfpEngine {
-    $engine = [IntPtr]::Zero
-    # 0xA = RPC_C_AUTHN_WINNT
-    $result = [WfpApi]::FwpmEngineOpen0($null, 0xA, [IntPtr]::Zero, [IntPtr]::Zero, [ref]$engine)
-    if ($result -ne 0) {
-        throw "FwpmEngineOpen0 failed with error 0x$($result.ToString('X8'))"
+    # 0x32 (ERROR_NOT_SUPPORTED) has been observed for RPC_C_AUTHN_WINNT on
+    # some builds - fall through the authentication methods until one opens.
+    $attempts = @(
+        @{ Name = 'RPC_C_AUTHN_WINNT';   Id = [uint32]0xA },
+        @{ Name = 'RPC_C_AUTHN_NONE';    Id = [uint32]0x0 },
+        @{ Name = 'RPC_C_AUTHN_DEFAULT'; Id = [uint32]0xFFFFFFFF }
+    )
+    foreach ($a in $attempts) {
+        $engine = [IntPtr]::Zero
+        $result = [WfpApi]::FwpmEngineOpen0($null, $a.Id, [IntPtr]::Zero, [IntPtr]::Zero, [ref]$engine)
+        if ($result -eq 0) {
+            Write-Ok "WFP engine opened ($($a.Name))"
+            return $engine
+        }
+        Write-Warn ("FwpmEngineOpen0 {0} failed: 0x{1}" -f $a.Name, $result.ToString('X8'))
     }
-    $engine
+    throw "Could not open the WFP engine. Is the 'BFE' (Base Filtering Engine) service running? Try .\getmeout.ps1 -Repair"
 }
 
 function Remove-WfpFilterById {
@@ -883,6 +899,58 @@ function Invoke-Loop {
 }
 
 # ---------------------------------------------
+#  REPAIR mode - broken network stack / WFP
+# ---------------------------------------------
+function Invoke-Repair {
+    Write-Step 'Repair mode: staged network stack repair'
+    Write-Warn 'Firewall policy is reset to factory defaults; Winsock/TCP get reset. Reboot afterwards.'
+
+    Invoke-Resilient 'BFE + firewall services' {
+        foreach ($svc in 'BFE','mpssvc') {
+            $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+            if ($s -and $s.Status -ne 'Running') {
+                Start-Service $svc -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 2
+            }
+            $now = (Get-Service -Name $svc -ErrorAction SilentlyContinue).Status
+            Write-Info ("{0}: {1}" -f $svc, $now)
+            if ($now -ne 'Running') { Write-Warn "$svc not running - WFP cannot work until it is." }
+        }
+    }
+
+    Invoke-Resilient 'WFP subsystem sanity check' {
+        $null = & netsh wfp show state
+        if ($LASTEXITCODE -ne 0) {
+            throw "netsh wfp failed (exit $LASTEXITCODE) - the WFP stack itself is damaged. Run 'sfc /scannow' and reboot."
+        }
+        Write-Ok 'WFP engine responds to queries'
+    }
+
+    Invoke-Resilient 'Factory-reset firewall policy' {
+        $null = & netsh advfirewall reset
+        if ($LASTEXITCODE -ne 0) { throw "netsh advfirewall reset failed (exit $LASTEXITCODE)" }
+        Write-Ok 'Firewall rules/policy reset to factory defaults (GPO will re-apply later)'
+    }
+
+    Invoke-Resilient 'Re-apply permissive firewall policy' {
+        $null = & netsh advfirewall set allprofiles firewallpolicy allowinbound,allowoutbound
+        if ($LASTEXITCODE -ne 0) { throw "netsh firewallpolicy failed (exit $LASTEXITCODE)" }
+        Write-Ok 'allow inbound / allow outbound on all profiles'
+    }
+
+    Invoke-Resilient 'Reset Winsock + TCP/IP' {
+        $null = & netsh winsock reset
+        $null = & netsh int ipv4 reset
+        $null = & netsh int ipv6 reset
+        Write-Warn 'Winsock + IPv4/IPv6 reset. REBOOT to complete, then rerun .\getmeout.ps1'
+    }
+
+    Write-Host ''
+    Write-Info 'After reboot: .\getmeout.ps1   (escape) and, if still isolated,'
+    Write-Info 'portal force-release script via -ForceReleaseScript, or -Api* credentials.'
+}
+
+# ---------------------------------------------
 #  Entry point
 # ---------------------------------------------
 try {
@@ -891,6 +959,9 @@ try {
 
 if ($Status) {
     Invoke-Status
+}
+elseif ($Repair) {
+    Invoke-Repair
 }
 elseif ($Restore) {
     Invoke-Restore -BackupFile $BackupFile
