@@ -587,7 +587,7 @@ function Invoke-WfpEscape {
     # Bounce BFE via sc.exe - a child process, like netsh (the PS service
     # cmdlets failed on SCM access on this box).
     Write-Warn 'Bouncing BFE via sc.exe, then retrying'
-    Invoke-Resilient 'sc.exe BFE bounce' {
+    $null = Invoke-Resilient 'sc.exe BFE bounce' {
         $null = sc.exe stop BFE
         Start-Sleep -Seconds 3
         $null = sc.exe start BFE
@@ -603,7 +603,7 @@ function Invoke-WfpEscape {
     Write-Fail ("Engine open refused after bounce: 0x{0}" -f ([WfpApi]::LastOpenError).ToString('X8'))
 
     # Final classification: can the firewall API write at all (netsh child)?
-    Invoke-Resilient 'netsh firewall probe' {
+    $null = Invoke-Resilient 'netsh firewall probe' {
         $null = netsh advfirewall firewall add rule name="getmeout-probe" dir=out action=allow
         $rc = $LASTEXITCODE
         $null = netsh advfirewall firewall delete rule name="getmeout-probe"
@@ -625,7 +625,7 @@ function Invoke-FirewallRescue {
     Write-Step "Firewall rescue"
 
     # 2a. Full policy backup first - always
-    Invoke-Resilient 'Firewall backup' {
+    $null = Invoke-Resilient 'Firewall backup' {
         $dir    = (Get-Location).Path
         $fwFile  = Join-Path $dir ("MDE_FirewallBackup_$(Get-Date -Format 'yyyyMMdd_HHmmss').wfw")
         $null = & netsh advfirewall export $fwFile
@@ -635,13 +635,13 @@ function Invoke-FirewallRescue {
 
     # 2b. Make sure the firewall is ON but permissive - isolation relies on
     #     default-block policies and block rules; outbound allow is the escape.
-    Invoke-Resilient 'Enable firewall on all profiles' {
+    $null = Invoke-Resilient 'Enable firewall on all profiles' {
         $null = & netsh advfirewall set allprofiles state on
         if ($LASTEXITCODE -ne 0) { throw "netsh set allprofiles state failed (exit $LASTEXITCODE)" }
         Write-Ok 'Firewall enabled on all profiles'
     }
 
-    Invoke-Resilient 'Set default allow outbound/inbound on all profiles' {
+    $null = Invoke-Resilient 'Set default allow outbound/inbound on all profiles' {
         $null = & netsh advfirewall set allprofiles firewallpolicy allowinbound,allowoutbound
         if ($LASTEXITCODE -ne 0) { throw "netsh firewallpolicy failed (exit $LASTEXITCODE)" }
         Write-Ok 'Default policy = allow inbound, allow outbound (all profiles)'
@@ -649,7 +649,7 @@ function Invoke-FirewallRescue {
 
     # 2c. Best effort: disable MDE-flavoured BLOCK rules still present in the
     #     active store (they re-appear only if a policy re-applies them).
-    Invoke-Resilient 'Disable MDE block rules in active store' {
+    $null = Invoke-Resilient 'Disable MDE block rules in active store' {
         $rules = Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Action Block -ErrorAction SilentlyContinue |
                  Where-Object { $_.DisplayName -match 'Defender|Sense|ATP|Endpoint' }
         if ($rules) {
@@ -669,7 +669,7 @@ function Invoke-NetworkRescue {
 
     Write-Step 'Network stack rescue'
 
-    Invoke-Resilient 'Enable network adapters' {
+    $null = Invoke-Resilient 'Enable network adapters' {
         foreach ($a in (Get-NetAdapter)) {
             if ($a.Status -eq 'Up') { continue }
             # Error 87 ("not supported") is normal for BT/virtual/disconnected
@@ -681,7 +681,7 @@ function Invoke-NetworkRescue {
         }
     }
 
-    Invoke-Resilient 'Core network services running' {
+    $null = Invoke-Resilient 'Core network services running' {
         foreach ($svc in 'Dhcp','dnscache','nlasvc','netprofm','wlansvc','dot3svc',
                          'bfe','mpssvc','iphlpsvc','rasman','sstpsvc','SharedAccess') {
             $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
@@ -692,7 +692,7 @@ function Invoke-NetworkRescue {
         }
     }
 
-    Invoke-Resilient 'Reset per-adapter DNS to DHCP-provided' {
+    $null = Invoke-Resilient 'Reset per-adapter DNS to DHCP-provided' {
         Get-NetAdapter | Where-Object Status -eq Up |
             Set-DnsClientServerAddress -ResetServerAddresses
         Clear-DnsClientCache -ErrorAction SilentlyContinue
@@ -718,7 +718,7 @@ function Invoke-VpnRescue {
     Write-Step 'VPN rescue'
 
     # 4a. Windows VPN stack + the usual enterprise agents
-    Invoke-Resilient 'VPN services running' {
+    $null = Invoke-Resilient 'VPN services running' {
         $vpnServices = @('RasMan','SstpSvc','IKEEXT','iphlpsvc') +
             @('vpnagent',                    # Cisco AnyConnect / Secure Client
               'PanGPS',                      # GlobalProtect
@@ -735,7 +735,7 @@ function Invoke-VpnRescue {
     }
 
     # 4b. WireGuard tunnels are per-config services named WireGuardTunnel$<name>
-    Invoke-Resilient 'WireGuard tunnels' {
+    $null = Invoke-Resilient 'WireGuard tunnels' {
         Get-Service -Name 'WireGuardTunnel$*' -ErrorAction SilentlyContinue | ForEach-Object {
             if ($_.Status -ne 'Running') {
                 Start-Service $_.Name -ErrorAction SilentlyContinue
@@ -745,7 +745,7 @@ function Invoke-VpnRescue {
     }
 
     # 4c. Virtual / tunnel adapters disabled by the lockdown
-    Invoke-Resilient 'Enable virtual adapters' {
+    $null = Invoke-Resilient 'Enable virtual adapters' {
         $virtual = Get-NetAdapter | Where-Object {
             $_.InterfaceDescription -match 'WireGuard|TAP|TUN|VPN|GlobalProtect|AnyConnect'
         }
@@ -776,7 +776,7 @@ function Invoke-UserRescue {
 
     Write-Step "User rescue: '$UnlockUser'"
 
-    Invoke-Resilient "Enable local user $UnlockUser" {
+    $null = Invoke-Resilient "Enable local user $UnlockUser" {
         $u = Get-LocalUser -Name $UnlockUser -ErrorAction Stop
         if (-not $u.Enabled) {
             Enable-LocalUser -Name $UnlockUser
@@ -821,7 +821,7 @@ function Invoke-ApiRelease {
         if (-not $script:ApiDeviceId) { return }
     }
 
-    Invoke-Resilient 'POST machines/{id}/unisolate' {
+    $null = Invoke-Resilient 'POST machines/{id}/unisolate' {
         $token = Get-ApiToken
         $body = @{ Comment = "Released by $scriptName (local admin)" } | ConvertTo-Json
         Invoke-RestMethod -Method Post -Headers @{ Authorization = "Bearer $token" } `
@@ -842,7 +842,7 @@ function Invoke-PortalRelease {
     }
 
     Write-Step 'Running portal force-release script (offlineCommand registry blob)'
-    Invoke-Resilient 'force-release script' {
+    $null = Invoke-Resilient 'force-release script' {
         if ($ForceReleaseScript -match '\.(cmd|bat)$') {
             $null = cmd /c "`"$ForceReleaseScript`""
         }
@@ -865,7 +865,7 @@ function Invoke-Status {
     }
 
     Write-Step 'WFP MDE providers / filters'
-    Invoke-Resilient 'WFP scan' {
+    $null = Invoke-Resilient 'WFP scan' {
         $xml = Get-WfpStateXml
         $guids   = Find-MdeProviderGuids -WfpXml $xml
         $filters = @(Get-MdeFilters -WfpXml $xml -ProviderGuids $guids)
@@ -880,7 +880,7 @@ function Invoke-Status {
     }
 
     Write-Step 'Recent SENSE isolation events (last 3 days)'
-    Invoke-Resilient 'SENSE event log' {
+    $null = Invoke-Resilient 'SENSE event log' {
         $ev = Get-WinEvent -FilterHashtable @{
                     LogName   = 'Microsoft-Windows-SENSE/Operational'
                     StartTime = (Get-Date).AddDays(-3)
@@ -897,7 +897,7 @@ function Invoke-Status {
     }
 
     Write-Step 'Firewall profiles'
-    Invoke-Resilient 'Firewall state' {
+    $null = Invoke-Resilient 'Firewall state' {
         Get-NetFirewallProfile | ForEach-Object {
             Write-Info ("{0,-10} enabled={1} defaultInbound={2} defaultOutbound={3}" -f
                 $_.Name, $_.Enabled, $_.DefaultInboundAction, $_.DefaultOutboundAction)
@@ -905,7 +905,7 @@ function Invoke-Status {
     }
 
     Write-Step 'Network'
-    Invoke-Resilient 'Adapter state' {
+    $null = Invoke-Resilient 'Adapter state' {
         Get-NetAdapter | ForEach-Object {
             Write-Info ("{0,-20} {1,-12} link={2}" -f $_.Name, $_.Status, $_.LinkSpeed)
         }
@@ -1010,7 +1010,7 @@ function Invoke-Repair {
     Write-Step 'Repair mode: staged network stack repair'
     Write-Warn 'Firewall policy is reset to factory defaults; Winsock/TCP get reset. Reboot afterwards.'
 
-    Invoke-Resilient 'BFE + firewall services' {
+    $null = Invoke-Resilient 'BFE + firewall services' {
         foreach ($svc in 'BFE','mpssvc') {
             $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
             if ($s -and $s.Status -ne 'Running') {
@@ -1023,7 +1023,7 @@ function Invoke-Repair {
         }
     }
 
-    Invoke-Resilient 'WFP subsystem sanity check' {
+    $null = Invoke-Resilient 'WFP subsystem sanity check' {
         $tmp = [System.IO.Path]::Combine($env:TEMP, "wfpcheck_$(Get-Random).xml")
         $null = & netsh wfp show state "file=$tmp"
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tmp)) {
@@ -1033,19 +1033,19 @@ function Invoke-Repair {
         Write-Ok 'WFP engine responds to queries'
     }
 
-    Invoke-Resilient 'Factory-reset firewall policy' {
+    $null = Invoke-Resilient 'Factory-reset firewall policy' {
         $null = & netsh advfirewall reset
         if ($LASTEXITCODE -ne 0) { throw "netsh advfirewall reset failed (exit $LASTEXITCODE)" }
         Write-Ok 'Firewall rules/policy reset to factory defaults (GPO will re-apply later)'
     }
 
-    Invoke-Resilient 'Re-apply permissive firewall policy' {
+    $null = Invoke-Resilient 'Re-apply permissive firewall policy' {
         $null = & netsh advfirewall set allprofiles firewallpolicy allowinbound,allowoutbound
         if ($LASTEXITCODE -ne 0) { throw "netsh firewallpolicy failed (exit $LASTEXITCODE)" }
         Write-Ok 'allow inbound / allow outbound on all profiles'
     }
 
-    Invoke-Resilient 'Reset Winsock + TCP/IP' {
+    $null = Invoke-Resilient 'Reset Winsock + TCP/IP' {
         $null = & netsh winsock reset
         $null = & netsh int ipv4 reset
         $null = & netsh int ipv6 reset
