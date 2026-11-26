@@ -560,8 +560,21 @@ function Invoke-WfpEscape {
 
     # 5. Purge via native helper - zero PS marshaling in the entire path
     Write-Step 'Purging BLOCK filters (native one-shot)'
-    $ids    = [long[]]@($blockFilters | ForEach-Object { [long]$_.FilterId })
-    $purged = [WfpApi]::PurgeFilters($ids)
+    $idList = New-Object System.Collections.Generic.List[long]
+    foreach ($f in $blockFilters) {
+        try {
+            $idText = "$($f.FilterId)".Trim()
+            if ($idText -match '^\d+$') { $idList.Add([long]$idText) }
+            else { Write-Warn "Skipping filter with unusable id '$idText'" }
+        }
+        catch { Write-Warn "Skipping filter with unusable id: $($_.Exception.Message)" }
+    }
+    if ($idList.Count -eq 0) {
+        Write-Warn 'No usable filter ids - nothing to purge.'
+        return $false
+    }
+    $idArray = [long[]]$idList.ToArray()
+    $purged = [WfpApi]::PurgeFilters($idArray)
     if ($purged -ge 0) {
         Write-Ok "Deleted : $purged filter(s)"
         return $true
@@ -579,7 +592,7 @@ function Invoke-WfpEscape {
         $null = sc.exe start mpssvc
         $null = sc.exe start iphlpsvc
     }
-    $purged = [WfpApi]::PurgeFilters($ids)
+    $purged = [WfpApi]::PurgeFilters($idArray)
     if ($purged -ge 0) {
         Write-Ok "Deleted after BFE bounce : $purged filter(s)"
         return $true
