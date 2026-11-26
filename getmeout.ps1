@@ -468,7 +468,7 @@ function Get-MdeFilters {
             SubLayerKey = Get-XmlText $f 'subLayerKey'
         }
     }
-    return ,$out
+    return $out
 }
 
 function Save-Backup {
@@ -562,12 +562,13 @@ function Invoke-WfpEscape {
     Write-Step 'Purging BLOCK filters (native one-shot)'
     $idList = New-Object System.Collections.Generic.List[long]
     foreach ($f in $blockFilters) {
-        try {
-            $idText = "$($f.FilterId)".Trim()
-            if ($idText -match '^\d+$') { $idList.Add([long]$idText) }
-            else { Write-Warn "Skipping filter with unusable id '$idText'" }
+        # Ids may arrive as scalars or as a whitespace-joined blob depending
+        # on how the upstream collection nested - split and take every token.
+        $idText = "$($f.FilterId)".Trim()
+        foreach ($tok in ($idText -split '[\s,;]+' | Where-Object { $_ })) {
+            if ($tok -match '^\d+$') { $idList.Add([long]$tok) }
+            else { Write-Warn "Skipping unusable id token '$tok'" }
         }
-        catch { Write-Warn "Skipping filter with unusable id: $($_.Exception.Message)" }
     }
     if ($idList.Count -eq 0) {
         Write-Warn 'No usable filter ids - nothing to purge.'
@@ -1223,6 +1224,8 @@ else {
         Invoke-Resilient 'Ping-blocker trace' { Trace-PingBlocker }
         Write-Host ''
         Write-Info 'Fixes to try, in order:'
+        Write-Info ' 0. LINK FIRST: the adapter list above shows no live media - cable in, Wi-Fi radio on,'
+        Write-Info '    dock/USB-LAN reseated. Nothing else matters until one adapter is Up.'
         Write-Info ' 1. Reboot - clears half-applied adapter/service state, then rerun.'
         Write-Info ' 2. .\getmeout.ps1 -Status  and check the BLOCK filter names / SENSE events.'
         Write-Info ' 3. Portal "force release" script via -ForceReleaseScript <path>, or -Api* release.'
