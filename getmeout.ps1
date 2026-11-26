@@ -399,19 +399,22 @@ function Save-Backup {
 function Open-WfpEngine {
     # 0x32 (ERROR_NOT_SUPPORTED) has been observed for RPC_C_AUTHN_WINNT on
     # some builds - fall through the authentication methods until one opens.
+    # No hex literals: some builds fail converting them to UInt32.
+    $authNone  = [uint32]0
+    $authWinnt = [uint32]10
     $attempts = @(
-        @{ Name = 'RPC_C_AUTHN_WINNT';   Id = [uint32]0xA },
-        @{ Name = 'RPC_C_AUTHN_NONE';    Id = [uint32]0x0 },
-        @{ Name = 'RPC_C_AUTHN_DEFAULT'; Id = [uint32]0xFFFFFFFF }
+        @{ Name = 'RPC_C_AUTHN_NONE';  Id = $authNone },
+        @{ Name = 'RPC_C_AUTHN_WINNT'; Id = $authWinnt }
     )
     foreach ($a in $attempts) {
-        $engine = [IntPtr]::Zero
-        $result = [WfpApi]::FwpmEngineOpen0($null, $a.Id, [IntPtr]::Zero, [IntPtr]::Zero, [ref]$engine)
-        if ($result -eq 0) {
+        $engine = [System.IntPtr]::Zero
+        $result = [WfpApi]::FwpmEngineOpen0($null, $a.Id, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [ref]$engine)
+        if ($result -eq [uint32]0) {
             Write-Ok "WFP engine opened ($($a.Name))"
             return $engine
         }
-        Write-Warn ("FwpmEngineOpen0 {0} failed: 0x{1}" -f $a.Name, $result.ToString('X8'))
+        $hex = $result.ToString('X8')
+        Write-Warn "FwpmEngineOpen0 $($a.Name) failed: 0x$hex"
     }
     throw "Could not open the WFP engine. Is the 'BFE' (Base Filtering Engine) service running? Try .\getmeout.ps1 -Repair"
 }
