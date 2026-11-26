@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     getmeout - escape toolkit for a Windows 11 box locked down by MDE
@@ -146,9 +146,9 @@ $ErrorActionPreference = 'Stop'
 
 $scriptName = Split-Path -Leaf $PSCommandPath
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  Output helpers
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 function Write-Step   { param($msg) Write-Host "`n[*] $msg" -ForegroundColor Cyan }
 function Write-Ok     { param($msg) Write-Host "    [+] $msg" -ForegroundColor Green }
 function Write-Warn   { param($msg) Write-Host "    [!] $msg" -ForegroundColor Yellow }
@@ -168,9 +168,9 @@ function Invoke-Resilient {
     }
 }
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  Connectivity test
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 function Test-Escape {
     $results = [ordered]@{}
 
@@ -194,9 +194,9 @@ function Test-Escape {
     return $any
 }
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  WFP API via P/Invoke
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 $wfpCode = @"
 using System;
 using System.Runtime.InteropServices;
@@ -224,22 +224,39 @@ if (-not ([System.Management.Automation.PSTypeName]'WfpApi').Type) {
     Add-Type -TypeDefinition $wfpCode
 }
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  WFP: enumerate / backup / remove  (core escape)
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 function Get-WfpStateXml {
     $tmpXml = [System.IO.Path]::Combine($env:TEMP, "wfpstate_$(Get-Random).xml")
+    if (Test-Path $tmpXml) { Remove-Item $tmpXml -Force -ErrorAction SilentlyContinue }
+
     Write-Step "Dumping WFP state to $tmpXml"
-    $null = & netsh wfp show state file="$tmpXml" 2>&1
-    if (-not (Test-Path $tmpXml)) {
-        throw "netsh wfp show state failed — run as Administrator."
+    # No 2>&1 here: under $ErrorActionPreference='Stop' Windows PowerShell 5.1
+    # turns harmless netsh stderr chatter into terminating NativeCommandErrors.
+    $null = & netsh wfp show state "file=$tmpXml"
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tmpXml)) {
+        throw "netsh wfp show state failed (exit $LASTEXITCODE) - run as Administrator."
     }
-    [xml](Get-Content $tmpXml -Raw)
+
+    $raw = Get-Content $tmpXml -Raw
     Remove-Item $tmpXml -Force -ErrorAction SilentlyContinue
+
+    try {
+        return [xml]$raw
+    }
+    catch {
+        # Some builds emit more than one root element; salvage the first
+        # complete <wfpstate> document instead of failing the whole run.
+        if ($raw -match '(?s)<wfpstate.*?</wfpstate>') {
+            return [xml]$Matches[0]
+        }
+        throw
+    }
 }
 
 function Get-XmlText {
-    # Safe text read from an XML node — never throws under StrictMode.
+    # Safe text read from an XML node - never throws under StrictMode.
     param($Node, [string]$XPath)
     if ($null -eq $Node) { return $null }
     $n = $Node.SelectSingleNode($XPath)
@@ -396,7 +413,7 @@ function Remove-WfpFilterById {
         Write-Ok "Deleted  filterId=$FilterId  name='$Name'"
         return $true
     }
-    # 0x80320003 = FWP_E_FILTER_NOT_FOUND — already gone, treat as success
+    # 0x80320003 = FWP_E_FILTER_NOT_FOUND - already gone, treat as success
     elseif ($result -eq 0x80320003) {
         Write-Warn "Filter not found (already removed?)  filterId=$FilterId  name='$Name'"
         return $true
@@ -478,31 +495,34 @@ function Invoke-WfpEscape {
     return $true
 }
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  Layer 2: firewall rescue
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 function Invoke-FirewallRescue {
     if ($SkipFirewall) { return }
 
     Write-Step "Firewall rescue"
 
-    # 2a. Full policy backup first — always
+    # 2a. Full policy backup first - always
     Invoke-Resilient 'Firewall backup' {
         $dir    = (Get-Location).Path
         $fwFile  = Join-Path $dir ("MDE_FirewallBackup_$(Get-Date -Format 'yyyyMMdd_HHmmss').wfw")
-        $null    = netsh advfirewall export "`"$fwFile`"" 2>&1
+        $null = & netsh advfirewall export $fwFile
+        if ($LASTEXITCODE -ne 0) { throw "netsh advfirewall export failed (exit $LASTEXITCODE)" }
         if (Test-Path $fwFile) { Write-Ok "Firewall policy exported to $fwFile" }
     }
 
-    # 2b. Make sure the firewall is ON but permissive — isolation relies on
+    # 2b. Make sure the firewall is ON but permissive - isolation relies on
     #     default-block policies and block rules; outbound allow is the escape.
     Invoke-Resilient 'Enable firewall on all profiles' {
-        $null = netsh advfirewall set allprofiles state on 2>&1
+        $null = & netsh advfirewall set allprofiles state on
+        if ($LASTEXITCODE -ne 0) { throw "netsh set allprofiles state failed (exit $LASTEXITCODE)" }
         Write-Ok 'Firewall enabled on all profiles'
     }
 
     Invoke-Resilient 'Set default allow outbound/inbound on all profiles' {
-        $null = netsh advfirewall set allprofiles firewallpolicy allowinbound,allowoutbound 2>&1
+        $null = & netsh advfirewall set allprofiles firewallpolicy allowinbound,allowoutbound
+        if ($LASTEXITCODE -ne 0) { throw "netsh firewallpolicy failed (exit $LASTEXITCODE)" }
         Write-Ok 'Default policy = allow inbound, allow outbound (all profiles)'
     }
 
@@ -520,9 +540,9 @@ function Invoke-FirewallRescue {
     }
 }
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  Layer 3: network stack rescue
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 function Invoke-NetworkRescue {
     if ($SkipNetwork) { return }
 
@@ -556,16 +576,16 @@ function Invoke-NetworkRescue {
     # Only on explicit request: full stack reset needs a reboot to complete.
     if ($FullReset) {
         Invoke-Resilient 'Winsock/TCP reset' {
-            $null = netsh winsock reset        2>&1
-            $null = netsh int ip reset         2>&1
+            $null = & netsh winsock reset
+            $null = & netsh int ip reset
             Write-Warn 'Winsock + TCP/IP reset done. Reboot to finish.'
         }
     }
 }
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  Layer 4: VPN rescue
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 function Invoke-VpnRescue {
     if ($SkipVpn) { return }
 
@@ -614,15 +634,15 @@ function Invoke-VpnRescue {
     # 4d. Optional: dial a phonebook entry
     if ($DialVpn) {
         Invoke-Resilient "Dial VPN '$DialVpn'" {
-            $out = rasdial $DialVpn 2>&1
+            $out = rasdial $DialVpn
             Write-Info ($out | Out-String).Trim()
         }
     }
 }
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  Layer 5: local user unlock (contained-user fallout)
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 function Invoke-UserRescue {
     if (-not $UnlockUser) { return }
 
@@ -639,10 +659,10 @@ function Invoke-UserRescue {
     }
 }
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  Official release via Defender for Endpoint API
 #  (the only release that survives the portal re-isolating you)
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 function Get-ApiToken {
     $body = @{
         grant_type    = 'client_credentials'
@@ -705,9 +725,9 @@ function Invoke-PortalRelease {
     }
 }
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  STATUS mode (read-only)
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 function Invoke-Status {
     Write-Step 'MDE services'
     foreach ($svc in 'WinDefend','SENSE','WdNisSvc','SecurityHealthService','mpssvc','BFE') {
@@ -771,9 +791,9 @@ function Invoke-Status {
     Write-Info 'also works, but is device-specific and expires after 3 days.'
 }
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  RESTORE mode (re-isolate from backup)
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 function Invoke-Restore {
     [CmdletBinding()]
     param([string]$BackupFile)
@@ -788,7 +808,7 @@ function Invoke-Restore {
     Write-Ok "Backup created: $($backup.CreatedAt)  on $($backup.ComputerName)"
     Write-Ok "$($backup.Filters.Count) filter(s) in backup"
 
-    # Restoration via WFP API requires the full filter structure — which is
+    # Restoration via WFP API requires the full filter structure - which is
     # complex to re-create from a JSON snapshot (conditions, sublayer weights, etc.).
     # The reliable restore path is to restart the Sense service, which re-registers
     # its filters automatically.
@@ -817,9 +837,9 @@ function Invoke-Restore {
     }
 }
 
-# ─────────────────────────────────────────────
-#  LOOP mode — survive repeated isolation
-# ─────────────────────────────────────────────
+# ---------------------------------------------
+#  LOOP mode - survive repeated isolation
+# ---------------------------------------------
 function Invoke-EscapeOnce {
     $escaped = Invoke-Resilient 'WFP escape' { Invoke-WfpEscape }
     Invoke-FirewallRescue
@@ -836,7 +856,7 @@ function Invoke-Loop {
 
     while ((Get-Date) -lt $deadline) {
         $ts = Get-Date -Format 'HH:mm:ss'
-        Write-Host "`n──────────── loop $ts ────────────" -ForegroundColor DarkGray
+        Write-Host "`n------------ loop $ts ------------" -ForegroundColor DarkGray
 
         $null = Invoke-EscapeOnce
 
@@ -844,20 +864,20 @@ function Invoke-Loop {
             $stable++
             Write-Ok "Connectivity OK ($stable consecutive)"
             if ($stable -ge 3) {
-                Write-Ok 'Connectivity stable — loop can be stopped with Ctrl+C, or let it run out.'
+                Write-Ok 'Connectivity stable - loop can be stopped with Ctrl+C, or let it run out.'
             }
         } else {
             $stable = 0
-            Write-Warn 'No connectivity — escaping again next cycle'
+            Write-Warn 'No connectivity - escaping again next cycle'
         }
 
         Start-Sleep -Seconds ($LoopMinutes * 60)
     }
 }
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  Entry point
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 try {
     Start-Transcript -Path (Join-Path $env:TEMP "getmeout_$(Get-Date -Format 'yyyyMMdd_HHmmss').log") -ErrorAction SilentlyContinue | Out-Null
 } catch { }
@@ -874,17 +894,17 @@ elseif ($Loop) {
     Invoke-Loop
 }
 else {
-    Write-Host "──────────── getmeout : MDE escape ────────────" -ForegroundColor White
+    Write-Host "------------ getmeout : MDE escape ------------" -ForegroundColor White
 
     Invoke-PortalRelease       # vendor-supported release, if script provided
     Invoke-ApiRelease          # official release, if credentials were given
     $null = Invoke-EscapeOnce  # local escape: WFP + firewall + network + VPN
 
     Write-Host ''
-    Write-Host '──────────────────────────────────────────' -ForegroundColor DarkGray
+    Write-Host '------------------------------------------' -ForegroundColor DarkGray
     Write-Host '  Escape attempt finished.' -ForegroundColor White
     Write-Host "  WFP backup : $BackupPath" -ForegroundColor Cyan
-    Write-Host '──────────────────────────────────────────' -ForegroundColor DarkGray
+    Write-Host '------------------------------------------' -ForegroundColor DarkGray
     Write-Host ''
     Write-Host '  To restore isolation:' -ForegroundColor White
     Write-Host "  .\$scriptName -Restore -BackupFile '$BackupPath'" -ForegroundColor Yellow
