@@ -446,17 +446,47 @@ function Open-WfpEngine {
         @{ Name = 'RPC_C_AUTHN_NONE';    Id = $authNone },
         @{ Name = 'RPC_C_AUTHN_DEFAULT'; Id = $authDefault }
     )
-    foreach ($a in $attempts) {
-        $engine = [System.IntPtr]::Zero
-        $result = [WfpApi]::FwpmEngineOpen0($null, $a.Id, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [ref]$engine)
-        if ($result -eq [uint32]0) {
-            Write-Ok "WFP engine opened ($($a.Name))"
-            return $engine
+
+    $tryAllAuths = {
+        foreach ($a in $attempts) {
+            $engine = [System.IntPtr]::Zero
+            $result = [WfpApi]::FwpmEngineOpen0($null, $a.Id, [System.IntPtr]::Zero, [System.IntPtr]::Zero, [ref]$engine)
+            if ($result -eq [uint32]0) {
+                Write-Ok "WFP engine opened ($($a.Name))"
+                return $engine
+            }
+            $hex = $result.ToString('X8')
+            Write-Warn "FwpmEngineOpen0 $($a.Name) failed: 0x$hex"
         }
-        $hex = $result.ToString('X8')
-        Write-Warn "FwpmEngineOpen0 $($a.Name) failed: 0x$hex"
+        $null
     }
-    throw "Could not open the WFP engine. Is the 'BFE' (Base Filtering Engine) service running? Try .\getmeout.ps1 -Repair"
+
+    $engine = & $tryAllAuths
+    if ($null -ne $engine -and $engine -ne [System.IntPtr]::Zero) { return $engine }
+
+    # Every auth mode refused: BFE's RPC state is wedged. A restart rebuilds
+    # the runtime filter set from the persistent store - which also clears
+    # the stale isolation filters. Then ask again.
+    Write-Warn 'All auth modes refused - restarting BFE once and retrying'
+    Invoke-Resilient 'Restart BFE' {
+        Restart-Service -Name BFE -Force -ErrorAction Stop
+        Start-Sleep -Seconds 3
+        foreach ($svc in 'mpssvc','iphlpsvc','SharedAccess') {
+            Start-Service -Name $svc -ErrorAction SilentlyContinue
+        }
+    }
+    $engine = & $tryAllAuths
+    if ($null -ne $engine -and $engine -ne [System.IntPtr]::Zero) { return $engine }
+
+    # Still refusing: classify WHERE the failure is, in one photo-able block.
+    $bits = if ([Environment]::Is64BitProcess) { 'x64' } else { 'x86' }
+    Write-Fail "Engine open refused in PowerShell $($PSVersionTable.PSVersion) ($bits)."
+    Invoke-Resilient 'Firewall API probe (same BFE, supported surface)' {
+        New-NetFirewallRule -DisplayName 'getmeout-probe' -Direction Outbound -Action Allow -ErrorAction Stop | Out-Null
+        Remove-NetFirewallRule  -DisplayName 'getmeout-probe' -ErrorAction SilentlyContinue
+        Write-Ok 'Firewall API accepts writes: BFE healthy - failure is in the raw P/Invoke path.'
+    }
+    throw "Could not open the WFP engine. Send the hex codes + probe result above."
 }
 
 function Remove-WfpFilterById {
