@@ -364,7 +364,7 @@ function Get-MdeFilters {
         $seen[$id] = $true
 
         $out += [PSCustomObject]@{
-            FilterId    = [ulong]$id
+            FilterId    = [System.UInt64]$id
             Name        = $name
             Description = $desc
             Action      = Get-XmlText $f 'action/type'
@@ -401,7 +401,7 @@ function Open-WfpEngine {
 }
 
 function Remove-WfpFilterById {
-    param([IntPtr]$Engine, [ulong]$FilterId, [string]$Name, [switch]$WhatIf)
+    param([IntPtr]$Engine, [System.UInt64]$FilterId, [string]$Name, [switch]$WhatIf)
 
     if ($WhatIf) {
         Write-Warn "[WHATIF] Would delete filterId=$FilterId  name='$Name'"
