@@ -298,6 +298,44 @@ function Invoke-DumpWfpDiagnostics {
     }
 }
 
+function Trace-PingBlocker {
+    # The definitive answer to 'what is blocking us': ping, capture WFP
+    # drop events, and name the filter that ate the packet.
+    $null = & ping.exe 8.8.8.8 -n 1 -w 1000
+
+    $evFile = [System.IO.Path]::Combine($env:TEMP, "netev_$(Get-Random).xml")
+    $null = & netsh wfp show netevents "file=$evFile"
+    if (-not (Test-Path $evFile)) { Write-Info 'netevents dump unavailable'; return }
+    $raw = Get-Content $evFile -Raw
+    Remove-Item $evFile -Force -ErrorAction SilentlyContinue
+
+    $xml = $null
+    try { $xml = [xml]$raw }
+    catch { if ($raw -match '(?s)<\w+.*</\w+>') { try { $xml = [xml]$Matches[0] } catch { } } }
+    if (-not $xml) { Write-Info 'netevents unparseable'; return }
+
+    # id -> name map for the filters currently loaded
+    $map = @{}
+    foreach ($f in (Get-WfpFilterItems -WfpXml (Get-WfpStateXml))) {
+        $id = Get-XmlText $f 'filterId'
+        if ($id) { $map["$id"] = '{0}  [provider={1}]' -f (Get-XmlText $f 'displayData/name'), (Get-XmlText $f 'providerKey') }
+    }
+
+    $drops = @($xml.SelectNodes("//*[local-name()='classifyDrop']"))
+    if ($drops.Count -eq 0) {
+        Write-Info 'No WFP drop events - blockage is below WFP (NDIS/driver level).'
+        return
+    }
+    Write-Info 'Most recent WFP drop events (the ping among them):'
+    foreach ($d in ($drops | Select-Object -Last 5)) {
+        $fid = Get-XmlText $d 'filterId'
+        $dst = Get-XmlText $d.ParentNode 'header/remoteAddrV4'
+        $port = Get-XmlText $d.ParentNode 'header/remotePort'
+        $name = if ($map.ContainsKey("$fid")) { $map["$fid"] } else { 'unknown id' }
+        Write-Host "      -> $dst${port}:filterId=$fid  $name" -ForegroundColor DarkGray
+    }
+}
+
 function Find-MdeProviderGuids {
     param([xml]$WfpXml)
 
@@ -400,11 +438,13 @@ function Open-WfpEngine {
     # 0x32 (ERROR_NOT_SUPPORTED) has been observed for RPC_C_AUTHN_WINNT on
     # some builds - fall through the authentication methods until one opens.
     # No hex literals: some builds fail converting them to UInt32.
-    $authNone  = [uint32]0
-    $authWinnt = [uint32]10
+    $authNone    = [uint32]0
+    $authWinnt   = [uint32]10
+    $authDefault = [uint32]::MaxValue   # RPC_C_AUTHN_DEFAULT - what netsh itself uses
     $attempts = @(
-        @{ Name = 'RPC_C_AUTHN_NONE';  Id = $authNone },
-        @{ Name = 'RPC_C_AUTHN_WINNT'; Id = $authWinnt }
+        @{ Name = 'RPC_C_AUTHN_WINNT';   Id = $authWinnt },
+        @{ Name = 'RPC_C_AUTHN_NONE';    Id = $authNone },
+        @{ Name = 'RPC_C_AUTHN_DEFAULT'; Id = $authDefault }
     )
     foreach ($a in $attempts) {
         $engine = [System.IntPtr]::Zero
@@ -922,10 +962,12 @@ function Invoke-Repair {
     }
 
     Invoke-Resilient 'WFP subsystem sanity check' {
-        $null = & netsh wfp show state
-        if ($LASTEXITCODE -ne 0) {
+        $tmp = [System.IO.Path]::Combine($env:TEMP, "wfpcheck_$(Get-Random).xml")
+        $null = & netsh wfp show state "file=$tmp"
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tmp)) {
             throw "netsh wfp failed (exit $LASTEXITCODE) - the WFP stack itself is damaged. Run 'sfc /scannow' and reboot."
         }
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         Write-Ok 'WFP engine responds to queries'
     }
 
@@ -990,6 +1032,7 @@ else {
         Invoke-Resilient 'WFP diagnostics' {
             Invoke-DumpWfpDiagnostics -WfpXml (Get-WfpStateXml)
         }
+        Invoke-Resilient 'Ping-blocker trace' { Trace-PingBlocker }
         Write-Host ''
         Write-Info 'Fixes to try, in order:'
         Write-Info ' 1. Reboot - clears half-applied adapter/service state, then rerun.'
