@@ -1039,11 +1039,19 @@ function Invoke-Repair {
 # ---------------------------------------------
 function Invoke-AsSystemRelay {
     Write-Step 'Relaying execution to LOCAL SYSTEM via scheduled task'
-    $argLine = Convert-PSBoundToArgs $script:PSBoundParameters @('AsSystem')
-    $taskCmd = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"$argLine"
-    Write-Info "Task command: $taskCmd"
+    $argLine   = Convert-PSBoundToArgs $script:PSBoundParameters @('AsSystem')
+    $scriptDir = Split-Path -Parent $PSCommandPath
+    $launcher  = Join-Path $scriptDir 'gm_run.cmd'
 
-    $null = schtasks /create /f /tn getmeoutRun /ru SYSTEM /rl HIGHEST /tr $taskCmd
+    # A .cmd launcher sidesteps PS's nested-quote mangling in /tr: the task
+    # argument is one plain path; all real quoting lives inside the file.
+    $line = '@echo off' + [Environment]::NewLine +
+            "powershell -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"$argLine" +
+            [Environment]::NewLine
+    Set-Content -Path $launcher -Value $line -Encoding ASCII
+    Write-Info "Launcher written: $launcher"
+
+    $null = schtasks /create /f /tn getmeoutRun /sc onlogon /ru SYSTEM /rl HIGHEST /tr $launcher
     if ($LASTEXITCODE -ne 0) { throw "schtasks create failed (exit $LASTEXITCODE) - are you elevated?" }
     $null = schtasks /run /tn getmeoutRun
     if ($LASTEXITCODE -ne 0) { throw "schtasks run failed (exit $LASTEXITCODE)" }
